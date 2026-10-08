@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace MetaVoiceChat.Input.Mic
 {
-    public class VcMic : IDisposable
+    public partial class VcMic : IDisposable
     {
         // Reads may run this much faster than real time, which absorbs capture clock drift.
         private const double RefillRatio = 1.1;
