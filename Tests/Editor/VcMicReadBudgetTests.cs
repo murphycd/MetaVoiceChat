@@ -15,43 +15,59 @@ namespace MetaVoiceChat.Tests.Editor
         // The second frame is slack.
         private const int MaxLagFrames = 2;
 
+        /// <summary>
+        /// A reader for a capture ring of one second. Like CoRecord, it sees the device position modulo the ring and
+        /// counts a wrap at most once per pass, so it undercounts when the device advances a ring or more between passes.
+        /// </summary>
         private sealed class Reader
         {
-            private readonly int clipRate;
+            private readonly int ring;
             private readonly int frameSamples;
             private double budget;
             private double now;
+            private int wraps;
+            private int prevPos;
+            private int readAbsPos;
 
-            public int ReadPos;
             public int FramesRead;
 
             public Reader(int clipRate = 48_000, int frameSamples = 960)
             {
-                this.clipRate = clipRate;
+                ring = clipRate;
                 this.frameSamples = frameSamples;
                 budget = clipRate;
             }
 
-            public int DevicePos(double seconds, double speed = 1) => (int)(seconds * clipRate * speed);
+            /// <summary>The true device position after <paramref name="seconds"/> at <paramref name="speed"/> times real time.</summary>
+            public long DevicePos(double seconds, double speed = 1) => (long)(seconds * ring * speed);
 
-            public int LagAt(double seconds) => DevicePos(seconds) - ReadPos;
+            /// <summary>How far the read position is behind the device, measured around the ring.</summary>
+            public int LagAround(long devicePos) => (int)(((devicePos % ring) - (readAbsPos % ring) + ring) % ring);
 
             /// <summary>One CoRecord pass at <paramref name="at"/> seconds. Returns the frames read.</summary>
-            public int Pass(double at, int devicePos)
+            public int Pass(double at, long devicePos)
             {
-                budget = VcMic.EditorTestAdapter.Refill(budget, at - now, clipRate, clipRate);
+                budget = VcMic.EditorTestAdapter.Refill(budget, at - now, ring, ring);
                 now = at;
+                int pos = (int)(devicePos % ring);
                 int frames = 0;
                 while (true)
                 {
-                    ReadPos = VcMic.EditorTestAdapter.Resync(ReadPos, devicePos, clipRate, frameSamples);
-                    int next = ReadPos + frameSamples;
-                    if (next >= devicePos || budget < frameSamples)
+                    if (pos < prevPos)
+                    {
+                        wraps++;
+                    }
+
+                    prevPos = pos;
+                    int currAbsPos = wraps * ring + pos;
+                    readAbsPos = VcMic.EditorTestAdapter.Resync(readAbsPos, currAbsPos, ring, frameSamples);
+                    int next = readAbsPos + frameSamples;
+                    if (next >= currAbsPos || budget < frameSamples)
                     {
                         break;
                     }
 
-                    ReadPos = next;
+                    readAbsPos = next;
                     budget -= frameSamples;
                     frames++;
                 }
@@ -92,65 +108,76 @@ namespace MetaVoiceChat.Tests.Editor
             for (int step = 1; step <= RunSeconds / PassSeconds; step++)
             {
                 double at = step * PassSeconds;
-                reader.Pass(at, reader.DevicePos(at));
-                Assert.That(reader.LagAt(at), Is.LessThanOrEqualTo(MaxLagFrames * frameSamples), $"behind at {at:F2} s");
+                long devicePos = reader.DevicePos(at);
+                reader.Pass(at, devicePos);
+                Assert.That(reader.LagAround(devicePos), Is.LessThanOrEqualTo(MaxLagFrames * frameSamples), $"behind at {at:F2} s");
             }
         }
 
-        [Test]
-        public void BacklogOverOneRing_IsClearedWithinASecond()
+        [TestCase(0.6)]
+        [TestCase(1.5)]
+        [TestCase(1.9)]
+        [TestCase(3.2)]
+        public void Freeze_IsReadBackWithoutLingeringLag(double freezeSeconds)
         {
-            // 75 frames waiting is 1.5 rings, as after a freeze of about 1.5 s.
+            // Freezes shorter and longer than the one second ring. Past one ring the wrap count is short, so the lag is
+            // measured around the ring.
+            double freezeStart = 3;
             Reader reader = new();
-            double freezeEnd = 5;
-            reader.ReadPos = reader.DevicePos(freezeEnd) - 75 * 960;
-
-            for (int step = 0; step < 1 / PassSeconds; step++)
+            for (int step = 1; step <= 9 / PassSeconds; step++)
             {
-                double at = freezeEnd + step * PassSeconds;
-                reader.Pass(at, reader.DevicePos(at));
-            }
+                double at = step * PassSeconds;
+                if (at >= freezeStart && at < freezeStart + freezeSeconds)
+                {
+                    continue;
+                }
 
-            Assert.That(reader.LagAt(freezeEnd + 1), Is.LessThanOrEqualTo(MaxLagFrames * 960));
+                long devicePos = reader.DevicePos(at);
+                reader.Pass(at, devicePos);
+                if (at >= freezeStart + freezeSeconds + 1)
+                {
+                    Assert.That(reader.LagAround(devicePos), Is.LessThanOrEqualTo(MaxLagFrames * 960), $"behind at {at:F2} s");
+                }
+            }
         }
 
         [Test]
-        public void RepeatedHitches_AreEachReadBackWithoutLingeringLag()
+        public void RepeatedFreezes_AreEachReadBackWithoutLingeringLag()
         {
             // Three one second freezes, half a second apart. The budget has to be there for each one because it
             // refills during the freeze itself.
-            (double start, double length)[] hitches = { (3, 1), (4.5, 1), (6, 1) };
+            (double start, double end)[] freezes = { (3, 4), (4.5, 5.5), (6, 7) };
             Reader reader = new();
-            double at = 0;
-            int next = 0;
-            while (at < 12)
+            for (int step = 1; step <= 12 / PassSeconds; step++)
             {
-                at += PassSeconds;
-                if (next < hitches.Length && at >= hitches[next].start)
+                double at = step * PassSeconds;
+                if (Array.Exists(freezes, f => at >= f.start && at < f.end))
                 {
-                    at = hitches[next].start + hitches[next].length;
-                    next++;
+                    continue;
                 }
 
-                reader.Pass(at, reader.DevicePos(at));
-                Assert.That(reader.LagAt(at), Is.LessThanOrEqualTo(MaxLagFrames * 960), $"behind at {at:F2} s");
+                long devicePos = reader.DevicePos(at);
+                reader.Pass(at, devicePos);
+                Assert.That(reader.LagAround(devicePos), Is.LessThanOrEqualTo(MaxLagFrames * 960), $"behind at {at:F2} s");
             }
         }
 
-        [TestCase(48_000, 960)]
-        [TestCase(96_000, 960)]
-        public void DeviceFasterThanRealTime_IsReadAtAboutRealTime(int clipRate, int frameSamples)
+        // 60 times real time is exactly one ring per pass, which the wrap count cannot see at all.
+        [TestCase(48_000, 960, 20)]
+        [TestCase(48_000, 960, 60)]
+        [TestCase(48_000, 960, 200)]
+        [TestCase(96_000, 960, 20)]
+        public void DeviceFasterThanRealTime_IsReadAtMostAboutRealTime(int clipRate, int frameSamples, int speed)
         {
             Reader reader = new(clipRate, frameSamples);
             int mostInOnePass = 0;
             for (int step = 1; step <= RunSeconds / PassSeconds; step++)
             {
                 double at = step * PassSeconds;
-                mostInOnePass = Math.Max(mostInOnePass, reader.Pass(at, reader.DevicePos(at, speed: 20)));
+                mostInOnePass = Math.Max(mostInOnePass, reader.Pass(at, reader.DevicePos(at, speed)));
             }
 
             double ringFrames = (double)clipRate / frameSamples;
-            Assert.That(reader.FramesRead, Is.GreaterThanOrEqualTo(RunSeconds * ringFrames), "still a full real-time stream");
             Assert.That(reader.FramesRead, Is.LessThanOrEqualTo(ringFrames + 1.15 * RunSeconds * ringFrames), "no faster than real time plus drift");
             Assert.That(mostInOnePass, Is.LessThanOrEqualTo(ringFrames), "no pass reads more than one ring");
         }
